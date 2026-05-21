@@ -81,25 +81,90 @@ Phase 2–3 (Variant B, add Kafka):
 ## Key decisions
 
 ### Decision 001: Two-speed (separate stream + batch), join only at gold
-Cadences differ massively (continuous vs hourly). Decoupling lets each track
-fail independently with its own SLA. The cadence difference becomes a feature
-at gold ("latest edits enriched with recent traffic"), not a problem.
+**Context**: Edits arrive as a continuous stream (~50 events/sec); pageviews
+arrive as hourly batch dumps. Cadence differs by ~3600x, and the two have
+different volume, freshness, and failure semantics.
+
+**Options considered**:
+- (A) One unified pipeline that ingests both on a shared cadence
+- (B) Two independent pipelines (stream + batch), joined only at gold
+- (C) Stream both (force pageviews into a streaming shape)
+
+**Chosen**: B.
+
+**Rationale**:
+- Forcing a continuous stream and an hourly batch into one cadence creates
+  artificial coupling — either the stream is throttled to hourly, or the
+  batch is polled wastefully.
+- Each track gets its own SLA and failure mode. The edit stream can fail and
+  recover without touching pageview ingestion, and vice versa.
+- The cadence gap becomes a *feature* at gold ("latest edits enriched with
+  recent traffic"), not a problem to engineer around.
+- (C) is contrived — pageviews are published hourly with delay; nothing is
+  gained by faking a stream.
+
+**Implications**: Two Delta table families, two orchestration paths (long-
+running stream job + Airflow batch). Gold marts must explicitly document which
+freshness window they target, since the two inputs are never equally fresh.
 
 ### Decision 002: Start without Kafka (Variant A), add Kafka in Phase 2–3
-Rationale: Variant A reaches a working end-to-end pipeline fastest, which
-matters given limited energy and the need for early interview material. Kafka
-is added later as a deliberate upgrade once the base stream flows.
-Upgrade is cheap: the SSE reader is reused (sink changes Delta→Kafka); silver
-and gold are untouched. The migration itself is a strong interview narrative
-("started with direct SSE→Delta, hit recovery/buffering limits, added Kafka to
-decouple source from processing"). Honest framing: at ~50 events/sec Spark and
-Kafka are oversized at the start — justified by accumulated volume and by
-learning production patterns, not by peak load.
+**Context**: EventStreams is SSE over HTTP, backed by Wikimedia's *internal*
+Kafka (not publicly reachable). SSE is not a native Spark streaming source.
+Need to get events into Delta reliably, with recovery.
+
+**Options considered**:
+- (A) SSE → Python consumer (foreachBatch) → Delta directly. Recovery via
+  persisting `last_event_id`.
+- (B) SSE → SSE-to-Kafka bridge → own Kafka → Spark (native kafka source) →
+  Delta. Buffering, replay, and source/processing decoupling out of the box.
+
+**Chosen**: Start with A, migrate to B in Phase 2–3 as a deliberate upgrade.
+
+**Rationale**:
+- A reaches a working end-to-end pipeline fastest. Given limited energy and
+  the need for early interview material, time-to-first-working-version wins.
+- The migration is cheap: the SSE reader is reused; only its sink changes
+  (Delta → Kafka). Silver and gold are untouched. Low switching cost means
+  starting simple carries little risk of wasted work.
+- The A→B migration is itself a strong interview narrative: "started with
+  direct SSE→Delta, hit recovery/buffering limits, added Kafka to decouple
+  the source from processing — here's the trade-off." That reads as real
+  engineering judgement, not Kafka-for-buzzword.
+- Honest framing for interviews: at ~50 events/sec, Spark and Kafka are
+  oversized at the start. They are justified by *accumulated* volume
+  (terabytes/year in Delta) and by learning production streaming patterns —
+  not by peak throughput. Being able to say where a tool is oversized is a
+  maturity signal.
+
+**Implications**: Phase 1 ships without Kafka. Phase 2–3 adds Kafka + bridge
+as two new Docker Compose components — two more failure points, accepted
+consciously. The bridge is still self-written (same SSE reader, Kafka sink).
 
 ### Decision 003: Schema-on-read in bronze, era-aware parsing in silver
-Bronze stores raw + metadata + era tag. Silver routes by date to the correct
-parser. Avoids re-ingesting on upstream schema change; isolates complexity
-where business logic belongs.
+**Context**: Pageviews have format eras (2015 format change, 2020 bot
+detection columns); Wikimedia versions event schemas explicitly. A
+long-running pipeline will outlive at least one upstream schema change.
+
+**Options considered**:
+- (A) Schema-on-write: normalize everything to one schema at ingestion (bronze)
+- (B) Schema-on-read: store raw + metadata in bronze, parse per-era in silver
+- (C) Hybrid: bronze stores raw rows + ingestion metadata + an era tag; silver
+  has era-aware parsers that route by source date
+
+**Chosen**: C.
+
+**Rationale**:
+- Avoids re-running ingestion (and re-doing backfills) every time upstream
+  changes format — bronze just keeps the raw bytes faithfully.
+- Preserves the ability to add new derived fields retroactively, since the
+  raw source is always retained.
+- Puts the version-handling complexity in silver, where business logic
+  belongs, instead of contaminating the ingestion layer.
+- Mirrors how real long-lived DE pipelines absorb upstream format drift.
+
+**Implications**: Silver has a parser dispatcher that routes each record to the
+correct parser by source date / era tag. Each era's parser is tested
+independently. Bronze carries an explicit era tag written at ingestion time.
 
 ### Decision 004: Partitioning + skew strategy
 Bronze: by date (natural ingestion unit, no skew). Silver: by date + bucket
