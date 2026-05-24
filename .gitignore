@@ -1,0 +1,5 @@
+# Local-only samples too large for GitHub (>100 MB)
+samples/pageviews_sample_full.txt
+
+# Python env
+.venv/

@@ -103,6 +103,13 @@ conflict, or conflict drive attention — is non-trivial and worth answering wel
 ### Edit stream — EventStreams `revision-create`
 - SSE over HTTP at `stream.wikimedia.org/v2/stream/mediawiki.revision-create`,
   backed by Wikimedia's internal Kafka (not publicly reachable). No auth, JSON.
+- **Measured rate (May 2026, evening CET)**: ~26 events/sec (~2.2M/day). Three
+  ~60-second samples gave 26–36 events/sec; variance is real (bot bursts shift
+  it). For comparison, `recentchange` ran ~34–36/sec in the same window but
+  ~34% of those are `categorize` noise — `revision-create` is already filtered
+  to actual saves, so the effective signal density is similar or higher.
+  Top wiki distribution: Wikidata ~33%, Commons ~29%, enwiki ~9%; reflects
+  bot-heavy batch editing of structured data, not article edit frequency.
 - One event per saved revision. Each event carries content hashes (`rev_sha1`,
   per-slot `rev_slot_sha1`), `rev_slot_origin_rev_id`, `rev_content_changed`,
   full editor context (`performer`), `rev_parent_id`, and a nested multi-slot
@@ -289,10 +296,10 @@ default.
 
 ### Phase 0 — Foundations (current)
 - Repo + Databricks workspace setup.
-- Sample `revision-create`: measure the actual edit-event rate (not yet
-  measured), and confirm `rev_sha1` / `rev_slot_sha1` / `rev_slot_origin_rev_id`
-  / `rev_content_changed` are reliably populated across a multi-wiki sample
-  (Decision 001 check).
+- Sample `revision-create`: measure the actual edit-event rate ✓ (~26/sec,
+  see Data sources). Confirm `rev_sha1` / `rev_slot_sha1` /
+  `rev_slot_origin_rev_id` / `rev_content_changed` are reliably populated
+  across a multi-wiki sample (Decision 001 check — still open).
 - Prototype notebook: read a `revision-create` batch + one `pageviews/` file.
 - This document.
 
